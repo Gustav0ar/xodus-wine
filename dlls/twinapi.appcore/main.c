@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2023 Mohamad Al-Jaf
+ * Copyright (C) 2026 Gustavo Rosa
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -16,18 +17,45 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include <stdlib.h>
+
 #include "initguid.h"
 #include "private.h"
+#include "wine/list.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(twinapi);
+
+struct _APPCONSTRAIN_REGISTRATION
+{
+    struct list entry;
+    PAPPCONSTRAIN_CHANGE_ROUTINE routine;
+    void *context;
+};
+
+static SRWLOCK constrained_lock = SRWLOCK_INIT;
+static struct list constrained_registrations = LIST_INIT(constrained_registrations);
 
 /***********************************************************************
  *           RegisterAppConstrainedChangeNotification (twinapi.appcore.@)
  */
 ULONG WINAPI RegisterAppConstrainedChangeNotification( PAPPCONSTRAIN_CHANGE_ROUTINE routine, void *context, PAPPCONSTRAIN_REGISTRATION *reg )
 {
-    FIXME( "routine %p, context %p, reg %p - stub.\n", routine, context, reg );
-    return ERROR_CALL_NOT_IMPLEMENTED;
+    PAPPCONSTRAIN_REGISTRATION registration;
+
+    TRACE( "routine %p, context %p, reg %p.\n", routine, context, reg );
+    if (!reg) return ERROR_INVALID_PARAMETER;
+    *reg = NULL;
+    if (!routine) return ERROR_INVALID_PARAMETER;
+    if (!(registration = malloc( sizeof(*registration) ))) return ERROR_NOT_ENOUGH_MEMORY;
+    registration->routine = routine;
+    registration->context = context;
+
+    /* Desktop processes remain unconstrained; do not synthesize notifications. */
+    AcquireSRWLockExclusive( &constrained_lock );
+    list_add_tail( &constrained_registrations, &registration->entry );
+    ReleaseSRWLockExclusive( &constrained_lock );
+    *reg = registration;
+    return ERROR_SUCCESS;
 }
 
 /***********************************************************************
@@ -44,7 +72,20 @@ ULONG WINAPI RegisterAppStateChangeNotification( PAPPSTATE_CHANGE_ROUTINE routin
  */
 void WINAPI UnregisterAppConstrainedChangeNotification( PAPPCONSTRAIN_REGISTRATION reg )
 {
-    FIXME( "reg %p - stub.\n", reg );
+    PAPPCONSTRAIN_REGISTRATION registration, found = NULL;
+
+    TRACE( "reg %p.\n", reg );
+    AcquireSRWLockExclusive( &constrained_lock );
+    LIST_FOR_EACH_ENTRY( registration, &constrained_registrations,
+                         struct _APPCONSTRAIN_REGISTRATION, entry )
+    {
+        if (registration != reg) continue;
+        list_remove( &registration->entry );
+        found = registration;
+        break;
+    }
+    ReleaseSRWLockExclusive( &constrained_lock );
+    free( found );
 }
 
 /***********************************************************************
@@ -53,6 +94,22 @@ void WINAPI UnregisterAppConstrainedChangeNotification( PAPPCONSTRAIN_REGISTRATI
 void WINAPI UnregisterAppStateChangeNotification( PAPPSTATE_REGISTRATION reg )
 {
     FIXME( "reg %p - stub.\n", reg );
+}
+
+BOOL WINAPI DllMain( HINSTANCE instance, DWORD reason, void *reserved )
+{
+    PAPPCONSTRAIN_REGISTRATION registration, next;
+
+    if (reason == DLL_PROCESS_DETACH && !reserved)
+    {
+        LIST_FOR_EACH_ENTRY_SAFE( registration, next, &constrained_registrations,
+                                 struct _APPCONSTRAIN_REGISTRATION, entry )
+        {
+            list_remove( &registration->entry );
+            free( registration );
+        }
+    }
+    return TRUE;
 }
 
 HRESULT WINAPI DllGetClassObject( REFCLSID clsid, REFIID riid, void **out )
